@@ -1,0 +1,1055 @@
+---
+title: 'Climate Project: Prediction of Soil Temperature'
+author: "Jonas Graf"
+date: "`r format(Sys.Date(),'%e - %B - %Y')`"
+output: 
+    pdf_document: 
+      highlight: kate
+      toc: yes
+      number_sections: yes
+      toc_depth: 2
+      latex_engine: lualatex
+mainfont: Source Sans Pro
+sansfont: Candara
+header-includes:
+- \usepackage{fvextra}
+- \usepackage[htt]{hyphenat}
+- \let\NormalTok\texttt
+- \DefineVerbatimEnvironment{Highlighting}{Verbatim}{breaklines, breakanywhere, breaksymbol=, breakanywheresymbolpre=, commandchars=\\\{\}}
+---
+  
+***
+  
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, tidy.opts=list(width.cutoff=60), tidy=TRUE)
+```
+\newpage
+# Data Setup
+```{r, include=TRUE, echo=TRUE, message=FALSE, warning=FALSE}
+
+# Libraries: install
+if(!require(tidyverse)) install.packages("tidyverse", repos = "http://cran.us.r-project.org")
+if(!require(caret)) install.packages("caret", repos = "http://cran.us.r-project.org")
+if(!require(cowplot)) install.packages("cowplot", repos = "http://cran.us.r-project.org")
+if(!require(magick)) install.packages("magick", repos = "http://cran.us.r-project.org")
+if(!require(data.table)) install.packages("data.table", repos = "http://cran.us.r-project.org")
+if(!require(ggplot2)) install.packages("ggplot2", repos = "http://cran.us.r-project.org")
+if(!require(kableExtra)) install.packages("kableExtra", repos = "http://cran.us.r-project.org")
+if(!require(stringr)) install.packages("stringr", repos = "http://cran.us.r-project.org")
+if(!require(tidyr)) install.packages("tidyr", repos = "http://cran.us.r-project.org")
+if(!require(forcats)) install.packages("forcats", repos = "http://cran.us.r-project.org")
+if(!require(formatR)) install.packages("formatR", repos = "http://cran.us.r-project.org")
+if(!require(ranger)) install.packages("ranger", repos = "http://cran.us.r-project.org")
+if(!require(lubridate)) install.packages("lubridate", repos = "http://cran.us.r-project.org")
+
+# Libraries: load
+library(tidyverse)
+library(caret)
+library(cowplot)
+library(magick)
+library(data.table)
+library(dplyr)
+library(ggplot2)
+library(kableExtra)
+library(tidyr)
+library(stringr)
+library(forcats)
+library(formatR)
+library(ranger)
+library(lubridate)
+```
+
+```{r, include=TRUE, echo=TRUE, message=FALSE, warning=FALSE}
+# German climate datasets, weather station Bremen (ID 691):
+## Source: Deutscher Wetterdienst
+
+# Downloading environment file
+dl <- tempfile()
+download.file("https://opendata.dwd.de/climate_environment/CDC/observations_germany/climate/daily/kl/historical/tageswerte_KL_00691_18900101_20211231_hist.zip", dl)
+
+env <- fread(text = gsub("::", "\t", readLines(unzip(dl, "produkt_klima_tag_18900101_20211231_00691.txt"))), col.names = c("STATIONS_ID","MESS_DATUM","QN_3",  "FX",  "FM","QN_4", "RSK","RSKF", "SDK","SHK_TAG",  "NM", "VPM",  "PM", "TMK", "UPM", "TXK", "TNK", "TGK","eor"))
+
+env <- env %>% select(c("MESS_DATUM", "RSK", "SDK", "VPM", "TMK", "UPM", "TXK", "TNK", "TGK"))
+
+# Downloading soil temperature file
+dl <- tempfile()
+download.file("https://opendata.dwd.de/climate_environment/CDC/observations_germany/climate/daily/soil_temperature/historical/tageswerte_EB_00691_19510101_20211231_hist.zip", dl)
+
+soil <- fread(text = gsub("::", "\t", readLines(unzip(dl, "produkt_erdbo_tag_19510101_20211231_00691.txt"))), col.names = c("STATIONS_ID","MESS_DATUM","QN_2","V_TE002M","V_TE005M","V_TE010M","V_TE020M","V_TE050M","eor"))
+
+soil <- soil %>% select(c("MESS_DATUM", "V_TE005M"))
+
+# Linking soil and env datasets
+climate <- left_join(soil, env, by="MESS_DATUM")
+
+# Removing measurement dates with a missing value ('-999')
+climate$label = ifelse(climate$RSK == "-999" | climate$SDK == "-999" | climate$VPM== "-999" | climate$TMK== "-999" | climate$UPM== "-999" | climate$TXK== "-999" | climate$TNK== "-999" | climate$TGK== "-999" | climate$V_TE005M == "-999", 0,1)
+
+climate <- climate[climate$label == 1,]
+climate <- climate[, c(1:10)]
+
+# Rounding temperatures
+climate$V_TE005M <- round(climate$V_TE005M,0)
+climate$TMK <- round(climate$TMK,0)
+climate$TXK <- round(climate$TXK,0)
+climate$TNK <- round(climate$TNK,0)
+climate$TGK <- round(climate$TGK,0)
+climate$UPM <- round(climate$UPM,0)
+
+# Partitioning 80/20 (i.e., 5 fold) according to the Pareto Principle
+## https://en.wikipedia.org/wiki/Pareto_principle
+set.seed(1, sample.kind="Rounding") 
+test_index <- createDataPartition(y=climate$V_TE005M, times=1, p=0.2, list=FALSE)
+edx <- climate[-test_index,]
+temp <- climate[test_index,]
+
+# Make sure variable values in validation set are also in edx set
+validation <- temp %>% 
+  semi_join(edx, by = "TMK") %>%
+  semi_join(edx, by = "SDK") %>%
+  semi_join(edx, by = "VPM") %>%
+  semi_join(edx, by = "UPM") %>%
+  semi_join(edx, by = "RSK") %>%
+  semi_join(edx, by = "TXK") 
+
+# Add rows removed from validation set back into edx set
+removed <- anti_join(temp, validation)
+edx <- rbind(edx, removed)
+rm(climate, env, soil, test_index, dl, removed, temp)
+```
+
+  
+***
+  
+\newpage
+# Introduction
+
+The overarching aim of this project is to predict soil temperatures using daily climate and soil observations captured at the weather station Bremen, Germany (station identification number 691). The data are provided by the *Deutscher Wetterdienst*. Bremen is a city situated in Northwestern Germany (marked red on map).  
+
+```{r map svg, eval=TRUE, echo=FALSE, message=FALSE, error=FALSE, warning=FALSE, fig.width = 12, fig.height = 8}
+map_bremen <- cowplot::ggdraw()+cowplot::draw_image("https://upload.wikimedia.org/wikipedia/commons/6/6f/Locator_map_HB_%28Bremen%29_in_Germany.svg")
+plot(map_bremen)
+```
+*Map* *Credit:* TUBS, CC BY-SA 3.0 <https://creativecommons.org/licenses/by-sa/3.0>, via Wikimedia Commons. 
+
+
+A detailed description of the data can be found here:  
+<https://opendata.dwd.de/climate_environment/CDC/observations_germany/climate/daily/kl/historical/DESCRIPTION_obsgermany_climate_daily_kl_historical_en.pdf>  
+<https://opendata.dwd.de/climate_environment/CDC/observations_germany/climate/daily/soil_temperature/historical/DESCRIPTION_obsgermany_climate_daily_soil_temperature_historical_en.pdf>  
+
+These data include >20,000 daily measurements (e.g., air temperature, relative humidity) captured between 1951 and 2021. Predicting soil temperature may be useful for farmers in order to find the optimal time point of planting  
+(<https://extensionpublications.unl.edu/assets/pdf/g2122.pdf>).  
+
+
+Three machine learning models will be fitted: linear, k nearest neighbors, and random forest. The goal is to achieve a Root Mean Squared Error (RMSE) below 1.0. The RMSE will be calculated using the following equation:
+
+\[\boxed{\mbox{RMSE} = \sqrt{\frac{1}{N} \sum_{i}^{} \left( \hat{y}_{i} - y_{i} \right)^2 }}\]  
+
+```{r, include=FALSE, echo=FALSE}
+# The following RMSE function will be applied:
+RMSE <- function(true_temps = NULL, predicted_temps = NULL) {
+    sqrt(mean((true_temps - predicted_temps)^2))
+}
+```
+
+
+
+The random forest model approach reached an RMSE of ~1.2. However, the model missed the overarching aim of the project (RMSE < 1.0).  
+
+
+
+***
+\newpage
+# Methods & Analysis
+
+## Descriptive data exploration
+
+First, an exploration of the training data is warranted.  
+
+### Variables: overview
+
+Here, an overview of the abbreviations, meanings and units of the variables is provided.
+
+```{r, echo=FALSE, include=TRUE}
+# Training dataset: classes of variables
+data.frame(Abbreviation = names(edx), Meaning = c("date of measurement", "daily soil temperature in 5cm depth", "daily precipitation height", "daily sunshine duration", "daily mean of vapor pressure", "daily mean of temperature", "daily mean of relative humidity", "daily maximum of temperature at 2m height", "daily minimum of temperature at 2m height", "daily minimum of air temperature at 5cm above ground"), Unit = c("yyyymmdd", "°C", "mm", "h", "hPa", "°C", "%", "°C","°C","°C")) %>% kable(format = "simple", align = 'c') 
+```
+
+### First six data entries: overview  
+
+The head function in R provides us a first descriptive overview of the variables.  
+
+```{r, echo=FALSE, include=TRUE}
+# Training dataset: first six entries
+kable(head(edx), format = "latex") %>% kable_styling(latex_options = c("scale_down", "HOLD_position"))
+```
+
+The overview revealed that the class of the 'MESS_DATUM' variables needs to be formatted from numeric to date. 
+
+### Classes: overview
+```{r, echo=FALSE, include=TRUE}
+# Training dataset: classes of variables
+data.frame(lapply(edx,class)) %>% kable(format = "latex") %>% kable_styling(latex_options = c("scale_down", "HOLD_position"))
+```
+
+\newpage
+### Reformatting date column & creating month of measurement variable
+In addition to the reformatting, a variable containing the month of measurement needs to be created. Soil temperatures likely follow a seasonal trend. Hence, a month of measurement variable may become useful for the analysis.  
+```{r Reformating date column, echo=TRUE, include=TRUE}
+edx$MESS_DATUM <- ymd(edx$MESS_DATUM)
+edx$month_m <- format(edx$MESS_DATUM, "%m")
+validation$MESS_DATUM <- ymd(validation$MESS_DATUM)
+validation$month_m <- format(validation$MESS_DATUM, "%m")
+```
+
+### First, last, and count of measurements
+Here, the dates of the first/last measurement is provided. Further, the table below depicts the total count of observations within the training dataset.    
+```{r, echo=TRUE, include=TRUE}
+data.frame(First = min(edx$MESS_DATUM), Last = max(edx$MESS_DATUM), Count = dim(edx)[1]) %>% kable(format = "simple", align = 'c') 
+```
+
+\newpage
+## Visualization
+
+
+Next, providing a visualization of the formatted training data is warranted.  
+
+
+
+### Distribution: soil temperature
+```{r hist soil temp, echo=FALSE, include=TRUE, fig.width = 12, fig.height = 8}
+edx %>%
+ggplot(aes(V_TE005M)) +
+geom_histogram(binwidth = 0.5, color = "grey") +
+xlab("°C") +
+ylab("Number of Measurements") 
+```
+
+The histogram of the soil temperature reveals that 0°C measurement are most frequent. This may reflect the physical phenomenon enthalpy of fusion. In short, an additional amount of energy is necessary in order for water to change from frozen to liquid. In case of water, 333 kJ are necessary for ice (e.g., within the soil) to melt; this is the same amount of energy necessary for heating ice from -40°C to 0°C. However, if enthalpy of fusion makes our predictions more difficult remains subject of speculation.
+
+The soil temperature values center around a median of 10°C.
+
+```{r echo=TRUE, include=TRUE}
+median(edx$V_TE005M)
+```
+
+\newpage
+### Seasonal trend: soil temperature
+```{r , echo=TRUE, include=TRUE,  fig.width = 12, fig.height = 8}
+# Date of measurement versus soil temperature - excerpt
+qplot(MESS_DATUM, V_TE005M, data = edx[1:1000,])
+```
+
+As expected, the soil temperature measurements follow a seasonal trend.
+
+\newpage
+
+### Distribution: air temperature - mean
+```{r Hist air temp mean, echo=FALSE, include=TRUE, fig.width = 12, fig.height = 8}
+edx %>%
+ggplot(aes(TMK)) +
+geom_histogram(binwidth = 0.5, color = "grey") +
+xlab("°C") +
+ylab("Number of Measurements") 
+```
+
+Just like soil temperature, the mean air temperature centers around a median of 10°C.  
+
+```{r echo=TRUE, include=TRUE}
+median(edx$TMK)
+```
+
+However, 14°C measurements are most frequent.  
+
+\newpage
+
+### Distribution: air temperature - max
+```{r Hist air temp max, echo=FALSE, include=TRUE, fig.width = 12, fig.height = 8}
+edx %>%
+ggplot(aes(TXK)) +
+geom_histogram(binwidth = 0.5, color = "grey") +
+xlab("°C") +
+ylab("Number of Measurements") 
+```
+
+The distribution of the maximum air temperature centers around a median of 14°C.    
+
+```{r echo=TRUE, include=TRUE}
+median(edx$TXK)
+```
+
+\newpage
+
+### Distribution: air temperature - min
+```{r Hist air temp min, echo=FALSE, include=TRUE, fig.width = 12, fig.height = 8}
+edx %>%
+ggplot(aes(TNK)) +
+geom_histogram(binwidth = 0.5, color = "grey") +
+xlab("°C") +
+ylab("Number of Measurements") 
+```
+
+The distribution of the minimum air temperature centers around a median of 6°C.    
+
+```{r echo=TRUE, include=TRUE}
+median(edx$TNK)
+```
+
+\newpage
+
+### Distribution: vapor pressure  
+```{r Hist VPM: counts by variable, echo=FALSE, include=TRUE, fig.width = 12, fig.height = 8}
+edx %>%
+ggplot(aes(VPM)) +
+geom_histogram(binwidth = 0.5, color = "grey") +
+xlab("hPa") +
+ylab("Number of Measurements") 
+```
+
+The distribution of vapor pressure appears to be shifted to below a median of 9.5%.   
+
+```{r echo=TRUE, include=TRUE}
+median(edx$VPM)
+```
+
+\newpage
+
+### Distribution: relative humidity  
+```{r hist rel humidity, echo=FALSE, include=TRUE, fig.width = 12, fig.height = 8}
+edx %>%
+ggplot(aes(UPM)) +
+geom_histogram(binwidth = 0.5, color = "grey") +
+xlab("%") +
+ylab("Number of Measurements") 
+```
+
+The distribution of the relative humidity, however, is shifted to values above the median of 81%.  
+
+```{r echo=TRUE, include=TRUE}
+median(edx$UPM)
+```
+
+\newpage
+
+## Models: building & evaluation
+
+Three models will be fitted: linear (with and without regularization), random forest, and k nearest neighbors.  
+
+First, a partition of the edx set for training/testing purposes needs to be created. I have opted for an 80/20 split inspired by the Pareto principle.  
+```{r partition of the edx set for training/testing, echo=TRUE, warning=FALSE, include=TRUE}
+# Creating data partition of edx for cross-validation
+# Validation set will be 20% of edx data
+set.seed(1, sample.kind="Rounding") 
+test_index <- createDataPartition(y = edx$V_TE005M, times = 1, p = 0.2, list = FALSE)
+train_edx <- edx[-test_index,]
+temp <- edx[test_index,]
+
+# Make sure TMK in validation set are also in edx set
+test_edx <- temp %>% 
+  semi_join(train_edx, by = "TMK") %>%
+  semi_join(train_edx, by = "TMK") %>%
+  semi_join(train_edx, by = "SDK") %>%
+  semi_join(train_edx, by = "VPM") %>%
+  semi_join(train_edx, by = "UPM") %>%
+  semi_join(train_edx, by = "RSK") %>%
+  semi_join(train_edx, by = "TXK") 
+
+# Add rows removed from validation set back into edx set
+removed <- anti_join(temp, test_edx)
+train_edx <- rbind(train_edx, removed)
+rm(test_index, temp)
+```
+
+
+## Linear model without regularization
+
+### Background
+Given that I am curious about the performance of a linear model on technical measurements/climate data, I have opted to include/develop this approach in addition to two more advanced models (i.e., k nearest neighbor, random forest).  
+
+### Predicting the mean temperature
+
+
+
+Always predicting the mean soil temperature is perhaps the simplest model. In the training data, the mean is ~10.2°C.  
+
+
+
+```{r, echo=TRUE, include=TRUE}
+mean(train_edx$V_TE005M)
+```
+
+```{r, echo=TRUE, include=TRUE}
+# Mean value of all soil temperatures
+mu_hat <- mean(train_edx$V_TE005M)
+# Predict the RMSE on the test_edx set
+mean_model_result <- RMSE(test_edx$V_TE005M, mu_hat)
+# Gathering RMSE results in a dataframe
+results <- data.frame(model="_Mean_ **test**", RMSE=mean_model_result) 
+results %>% kable(format = "simple", align = 'c')
+```
+
+An RMSE of >7 underscores a very poor model performance.  
+
+### Considering air temperature    
+
+The goal is to improve the 'predicting the mean' model by considering the air temperature effect.  
+
+The following equation depicts this approach:
+
+\[\boxed{Y_{i} = \hat{\mu} + b_i + \epsilon_{i}}\]
+
+In short, $\hat{\mu}$ represents the mean soil temperature and $\varepsilon_{i}$ the independent errors. The $b_i$ represents the magnitude of the air temperature effect $i$.
+
+```{r, echo=TRUE, include=TRUE}
+# Mean value of all soil temperature measurements
+mu_hat <- mean(train_edx$V_TE005M)
+# Calculating the mean by mean air temperature
+TMK_avgs <- train_edx %>%
+   group_by(TMK) %>%
+   summarize(b_i = mean(V_TE005M - mu_hat))
+# Computing predicted soil temperatures on test_edx dataset
+TMK_model <- test_edx %>%
+    left_join(TMK_avgs, by="TMK") %>%
+    mutate(pred = mu_hat + b_i) %>%
+    pull(pred)
+mean_TMK_result <- RMSE(test_edx$V_TE005M, TMK_model)
+# Expanding the results dataframe
+results <- results %>% add_row(model="_Mean_+_TMK_ **test**", RMSE=mean_TMK_result)
+results %>% kable(format = "simple", align = 'c')
+```
+
+As expected, when considering the air temperature, the RMSE is very much improved (decreased), but still rather poor with a value >1.5.
+
+### Considering mean air temperature & vapor pressure  
+
+The RMSE is still too high. Hence, further considerations are warranted. Here, a vapor pressure effect is being accounted for.  
+
+The following equation depicts this more complex approach:
+
+\[\boxed{Y_{v,i} = \hat{\mu} + b_v + b_i + \epsilon_{v,i}}\]
+
+In addition to the mean air temperature equation above, $b_v$ represents the magnitude of a potential vapor pressure effect $v$.  
+
+
+```{r, echo=TRUE, include=TRUE}
+# Mean value of all soil temperature measurements
+mu_hat <- mean(train_edx$V_TE005M)
+# Calculating the mean by mean air temperature
+TMK_avgs <- train_edx %>%
+   group_by(TMK) %>%
+   summarize(b_i = mean(V_TE005M - mu_hat))
+# Calculating mean by min air temp
+VPM_avgs <- train_edx %>%
+   left_join(TMK_avgs, by="TMK") %>%
+   group_by(VPM) %>%
+   summarize(b_v = mean(V_TE005M - mu_hat - b_i))
+# Computing predicted soil temperatures on test_edx dataset
+mean_TMK_VPM_model <- test_edx %>%
+   left_join(TMK_avgs, by="TMK") %>%
+   left_join(VPM_avgs, by="VPM") %>%
+   mutate(pred = mu_hat + b_v + b_i) %>%
+   pull(pred)
+mean_TMK_VPM_model_result <- RMSE(mean_TMK_VPM_model, test_edx$V_TE005M)
+# Expanding results dataframe
+results <- results %>% add_row(model="_Mean_+_TMK_+_VPM_ **test**", RMSE=mean_TMK_VPM_model_result)
+results %>% kable(format = "simple", align = 'c')
+```
+
+
+Considering pressure increased the RMSE, which is why this parameter will not be considered.
+
+### Considering mean & minimum air temperature  
+
+The following equation represents this model:
+
+\[\boxed{Y_{m,i} = \hat{\mu} + b_i + b_m + \epsilon_{m,i}}\]
+
+In addition to the previous model,  $b_m$ mirrors the magnitude of a given minimum air temperature effect $m$ on the soil temperature.  
+
+```{r, echo=TRUE, include=TRUE}
+# Mean soil temperatures of all soil temperature measurements
+mu_hat <- mean(train_edx$V_TE005M)
+# Calculating the mean by mean air temperature
+TMK_avgs <- train_edx %>%
+   group_by(TMK) %>%
+   summarize(b_i = mean(V_TE005M - mu_hat))
+# Calculating mean by min air temperature
+TNK_avgs <- train_edx %>%
+   left_join(TMK_avgs, by="TMK") %>%
+   group_by(TNK) %>%
+   summarize(b_m = mean(V_TE005M - mu_hat - b_i))
+# Computing predicted soil temperatures on test_edx dataset
+mean_TMK_TNK_model <- test_edx %>%
+   left_join(TMK_avgs, by="TMK") %>%
+   left_join(TNK_avgs, by="TNK") %>%
+   mutate(pred = mu_hat + b_m + b_i) %>%
+   pull(pred)
+mean_TMK_TNK_model_result <- RMSE(mean_TMK_TNK_model, test_edx$V_TE005M)
+# Expanding results dataframe
+results <- results %>% add_row(model="_Mean_+_TMK_+_TNK_ **test**", RMSE=mean_TMK_TNK_model_result)
+results %>% kable(format = "simple", align = 'c')
+```
+
+The minimum air temperature slightly decreases the RMSE. Perhaps including the relative humidity into our model may lead to further improvement.  
+
+
+### Considering mean & minimum air temperature, & relative humidity  
+
+The following equation represents this model ($b_h$ represents mean relative humidity):
+
+\[\boxed{Y_{m,h,i} = \hat{\mu} + b_i + b_m + b_h + \epsilon_{m,h,i}}\]
+
+```{r, echo=TRUE, include=TRUE}
+# Mean value of all soil temperature measurements
+mu_hat <- mean(train_edx$V_TE005M)
+# Calculating the mean by mean air temperature
+TMK_avgs <- train_edx %>%
+   group_by(TMK) %>%
+   summarize(b_i = mean(V_TE005M - mu_hat))
+# Calculating mean by min air temp
+TNK_avgs <- train_edx %>%
+   left_join(TMK_avgs, by="TMK") %>%
+   group_by(TNK) %>%
+   summarize(b_m = mean(V_TE005M - mu_hat - b_i))
+# Calculating mean by relative humidity
+UPM_avgs <- train_edx %>%
+   left_join(TMK_avgs, by="TMK") %>%
+   left_join(TNK_avgs, by="TNK") %>%
+   group_by(UPM) %>%
+   summarize(b_h = mean(V_TE005M - mu_hat - b_m - b_i))
+# Compute the predicted soil temps on test_edx dataset
+mean_TMK_TNK_UPM_model <- test_edx %>%
+    left_join(TMK_avgs, by="TMK") %>%
+    left_join(TNK_avgs, by="TNK") %>%
+    left_join(UPM_avgs, by="UPM") %>%
+    mutate(pred = mu_hat + b_m + b_i + b_h) %>%
+    pull(pred)
+mean_TMK_TNK_UPM_model_result <- RMSE(mean_TMK_TNK_UPM_model, test_edx$V_TE005M)
+# Expanding results dataframe
+results <- results %>% add_row(model="_Mean_+_TMK_+_TNK_+_UPM_ **test**", RMSE=mean_TMK_TNK_UPM_model_result)
+results %>% kable(format = "simple", align = 'c')
+```
+
+Adding relative humidity to the linear model improved (decreased) the RMSE, which is why this variable will be included.  
+
+
+
+### Considering mean & minimum air temperature, relative humidity & precipitation height  
+
+The following equation represents this expanded model($b_p$ stands for mean precipitation height):
+
+\[\boxed{Y_{m,h,i,p} = \hat{\mu} + b_i + b_m + b_h + b_p + \epsilon_{m,h,i,p}}\]
+
+```{r, echo=TRUE, include=TRUE}
+# Mean value of all soil temperature measurements
+mu_hat <- mean(train_edx$V_TE005M)
+# Calculating the mean by mean air temperature
+TMK_avgs <- train_edx %>%
+   group_by(TMK) %>%
+   summarize(b_i = mean(V_TE005M - mu_hat))
+# Calculating mean by min air temp
+TNK_avgs <- train_edx %>%
+   left_join(TMK_avgs, by="TMK") %>%
+   group_by(TNK) %>%
+   summarize(b_m = mean(V_TE005M - mu_hat - b_i))
+# Calculating mean by relative humidity
+UPM_avgs <- train_edx %>%
+   left_join(TMK_avgs, by="TMK") %>%
+   left_join(TNK_avgs, by="TNK") %>%
+   group_by(UPM) %>%
+   summarize(b_h = mean(V_TE005M - mu_hat - b_i - b_m))
+# Calculating mean by precipitation height
+RSK_avgs <- train_edx %>%
+    left_join(TMK_avgs, by="TMK") %>%
+    left_join(VPM_avgs, by="VPM") %>%
+    left_join(TNK_avgs, by="TNK") %>%
+    left_join(UPM_avgs, by="UPM") %>%
+    group_by(RSK) %>%
+    summarize(b_p = mean(V_TE005M - mu_hat - b_m - b_i - b_h))
+# Computing predicted soil temperatures on test_edx dataset
+mean_TMK_TNK_UPM_RSK_model <- test_edx %>%
+    left_join(TMK_avgs, by="TMK") %>%
+    left_join(TNK_avgs, by="TNK") %>%
+    left_join(UPM_avgs, by="UPM") %>%
+    left_join(RSK_avgs, by="RSK") %>%
+    mutate(pred = mu_hat + b_m + b_i + b_h + b_p) %>%
+    pull(pred)
+mean_TMK_TNK_UPM_RSK_model_result <- RMSE(mean_TMK_TNK_UPM_RSK_model, test_edx$V_TE005M)
+# Expanding results dataframe
+results <- results %>% add_row(model="_Mean_+_TMK_+_TNK_+_UPM_+_RSK_ **test**", RMSE=mean_TMK_TNK_UPM_RSK_model_result)
+results %>% kable(format = "simple", align = 'c') 
+```
+
+
+Considering precipitation height increased the RMSE, which is why this parameter will not be considered. 
+
+### Considering mean & minimum air temperature, relative humidity & sunshine duration  
+
+The following equation represents this expanded model ($b_s$ represents mean daily sunshine duration):
+
+\[\boxed{Y_{m,h,i,s} = \hat{\mu} + b_i + b_m + b_h + b_s + \epsilon_{m,h,i,s}}\]
+
+```{r, echo=TRUE, include=TRUE}
+# Mean value of all soil temperature measurements
+mu_hat <- mean(train_edx$V_TE005M)
+# Calculating the mean by mean air temperature
+TMK_avgs <- train_edx %>%
+   group_by(TMK) %>%
+   summarize(b_i = mean(V_TE005M - mu_hat))
+# Calculating mean by min air temp
+TNK_avgs <- train_edx %>%
+   left_join(TMK_avgs, by="TMK") %>%
+   group_by(TNK) %>%
+   summarize(b_m = mean(V_TE005M - mu_hat - b_i))
+# Calculating mean by relative humidity
+UPM_avgs <- train_edx %>%
+   left_join(TMK_avgs, by="TMK") %>%
+   left_join(TNK_avgs, by="TNK") %>%
+   group_by(UPM) %>%
+   summarize(b_h = mean(V_TE005M - mu_hat - b_i - b_m))
+# Calculating mean by sunshine duration
+SDK_avgs <- train_edx %>%
+    left_join(TMK_avgs, by="TMK") %>%
+    left_join(VPM_avgs, by="VPM") %>%
+    left_join(TNK_avgs, by="TNK") %>%
+    left_join(UPM_avgs, by="UPM") %>%
+    group_by(SDK) %>%
+    summarize(b_s = mean(V_TE005M - mu_hat - b_m - b_i - b_h))
+# Computing predicted soil temperatures on test_edx dataset
+mean_TMK_TNK_UPM_SDK_model <- test_edx %>%
+    left_join(TMK_avgs, by="TMK") %>%
+    left_join(TNK_avgs, by="TNK") %>%
+    left_join(UPM_avgs, by="UPM") %>%
+    left_join(SDK_avgs, by="SDK") %>%
+    mutate(pred = mu_hat + b_m + b_i + b_h + b_s) %>%
+    pull(pred)
+mean_TMK_TNK_UPM_SDK_model_result <- RMSE(mean_TMK_TNK_UPM_SDK_model, test_edx$V_TE005M)
+# Expanding results dataframe
+results <- results %>% add_row(model="_Mean_+_TMK_+_TNK_+_UPM_+_SDK_ **test**", RMSE=mean_TMK_TNK_UPM_SDK_model_result)
+results %>% kable(format = "simple", align = 'c') 
+```
+
+Considering daily sunshine duration increased the RMSE, which is why this parameter will not be considered. 
+
+### Considering mean, maximum & minimum air temperature, & relative humidity
+The following equation represents this expanded model:
+
+\[\boxed{Y_{m,h,i,x} = \hat{\mu} + b_i + b_m + b_h + b_x + \epsilon_{m,h,i,x}}\]  
+
+```{r, echo=TRUE, include=TRUE}
+# Mean value of all soil temperature measurements
+mu_hat <- mean(train_edx$V_TE005M)
+TMK_avgs <- train_edx %>% # Calculating mean by mean air temperature
+   group_by(TMK) %>%
+   summarize(b_i = mean(V_TE005M - mu_hat))
+TNK_avgs <- train_edx %>% # Calculating mean by min air temp
+   left_join(TMK_avgs, by="TMK") %>%
+   group_by(TNK) %>%
+   summarize(b_m = mean(V_TE005M - mu_hat - b_i))
+UPM_avgs <- train_edx %>% # Calculating mean by relative humidity
+   left_join(TMK_avgs, by="TMK") %>%
+   left_join(TNK_avgs, by="TNK") %>%
+   group_by(UPM) %>%
+   summarize(b_h = mean(V_TE005M - mu_hat - b_i - b_m))
+TXK_avgs <- train_edx %>% # Calculating mean by max air temp
+    left_join(TMK_avgs, by="TMK") %>%
+    left_join(VPM_avgs, by="VPM") %>%
+    left_join(TNK_avgs, by="TNK") %>%
+    left_join(UPM_avgs, by="UPM") %>%
+    group_by(TXK) %>%
+    summarize(b_x = mean(V_TE005M - mu_hat - b_m - b_i - b_h))
+mean_TMK_TNK_UPM_TXK_model <- test_edx %>% # Predicting soil temperatures on test_edx dataset
+    left_join(TMK_avgs, by="TMK") %>%
+    left_join(TNK_avgs, by="TNK") %>%
+    left_join(UPM_avgs, by="UPM") %>%
+    left_join(TXK_avgs, by="TXK") %>%
+    mutate(pred = mu_hat + b_m + b_i + b_h + b_x) %>%
+    pull(pred)
+mean_TMK_TNK_UPM_TXK_model_result <- RMSE(mean_TMK_TNK_UPM_TXK_model, test_edx$V_TE005M)
+# Expanding results dataframe
+results <- results %>% add_row(model="_Mean_+_TMK_+_TNK_+_UPM_+_TXK_ **test**", RMSE=mean_TMK_TNK_UPM_TXK_model_result)
+results %>% kable(format = "simple", align = 'c') 
+```
+
+Adding the maximum air temperature to the model improved (decreased) the RMSE, which is why this variable will be included.
+
+### Considering mean, maximum & minimum air temperature, relative humidity & minimum air temperature 5cm above ground  
+
+The following equation represents this expanded model ($b_g$ represents the minimum air temperature 5cm above ground):
+
+\[\boxed{Y_{m,h,i,x,g} = \hat{\mu} + b_i + b_m + b_h + b_x + b_g + \epsilon_{m,h,i,x,g}}\]
+
+```{r, echo=TRUE, include=TRUE}
+# Mean value of all soil temperature measurements
+mu_hat <- mean(train_edx$V_TE005M)
+# Calculating the mean by mean air temperature
+TMK_avgs <- train_edx %>%
+   group_by(TMK) %>%
+   summarize(b_i = mean(V_TE005M - mu_hat))
+# Calculating mean by min air temp
+TNK_avgs <- train_edx %>%
+   left_join(TMK_avgs, by="TMK") %>%
+   group_by(TNK) %>%
+   summarize(b_m = mean(V_TE005M - mu_hat - b_i))
+# Calculating mean by relative humidity
+UPM_avgs <- train_edx %>%
+   left_join(TMK_avgs, by="TMK") %>%
+   left_join(TNK_avgs, by="TNK") %>%
+   group_by(UPM) %>%
+   summarize(b_h = mean(V_TE005M - mu_hat - b_i - b_m))
+# Calculating mean by max air temp
+TXK_avgs <- train_edx %>%
+    left_join(TMK_avgs, by="TMK") %>%
+    left_join(VPM_avgs, by="VPM") %>%
+    left_join(TNK_avgs, by="TNK") %>%
+    left_join(UPM_avgs, by="UPM") %>%
+    group_by(TXK) %>%
+    summarize(b_x = mean(V_TE005M - mu_hat - b_m - b_i - b_h))
+# Calculating mean by min air temp 2cm above ground
+TGK_avgs <- train_edx %>%
+    left_join(TMK_avgs, by="TMK") %>%
+    left_join(VPM_avgs, by="VPM") %>%
+    left_join(TNK_avgs, by="TNK") %>%
+    left_join(UPM_avgs, by="UPM") %>%
+    left_join(TXK_avgs, by="TXK") %>%
+    group_by(TGK) %>%
+    summarize(b_g = mean(V_TE005M - mu_hat - b_m - b_i - b_h - b_x))
+# Computing predicted soil temperatures on test_edx dataset
+mean_TMK_TNK_UPM_TXK_TGK_model <- test_edx %>%
+    left_join(TMK_avgs, by="TMK") %>%
+    left_join(TNK_avgs, by="TNK") %>%
+    left_join(UPM_avgs, by="UPM") %>%
+    left_join(TXK_avgs, by="TXK") %>%
+    left_join(TGK_avgs, by="TGK") %>%
+    mutate(pred = mu_hat + b_m + b_i + b_h + b_x + b_g) %>%
+    pull(pred)
+mean_TMK_TNK_UPM_TXK_TGK_model_result <- RMSE(mean_TMK_TNK_UPM_TXK_TGK_model, test_edx$V_TE005M)
+# Expanding results dataframe
+results <- results %>% add_row(model="_Mean_+_TMK_+_TNK_+_UPM_+_TXK_+_TGK_ **test**", RMSE=mean_TMK_TNK_UPM_TXK_TGK_model_result)
+results %>% kable(format = "simple", align = 'c') 
+```
+
+Adding minimum temperature 2cm above ground to the model increased the RMSE, which is why this parameter will not be considered. 
+
+### Considering mean, maximum & minimum air temperature, relative humidity & month of measurement  
+
+The following equation represents this expanded model ($b_t$ mirrors the month of measurement):
+
+\[\boxed{Y_{m,h,i,x,g,t} = \hat{\mu} + b_i + b_m + b_h + b_x + b_t + \epsilon_{m,h,i,x,g,t}}\]
+
+```{r, echo=TRUE, include=TRUE}
+# Mean value of all soil temperature measurements
+mu_hat <- mean(train_edx$V_TE005M)
+# Calculating the mean by mean air temperature
+TMK_avgs <- train_edx %>%
+   group_by(TMK) %>%
+   summarize(b_i = mean(V_TE005M - mu_hat))
+# Calculating mean by min air temp
+TNK_avgs <- train_edx %>%
+   left_join(TMK_avgs, by="TMK") %>%
+   group_by(TNK) %>%
+   summarize(b_m = mean(V_TE005M - mu_hat - b_i))
+# Calculating mean by relative humidity
+UPM_avgs <- train_edx %>%
+   left_join(TMK_avgs, by="TMK") %>%
+   left_join(TNK_avgs, by="TNK") %>%
+   group_by(UPM) %>%
+   summarize(b_h = mean(V_TE005M - mu_hat - b_i - b_m))
+# Calculating mean by max air temp
+TXK_avgs <- train_edx %>%
+    left_join(TMK_avgs, by="TMK") %>%
+    left_join(VPM_avgs, by="VPM") %>%
+    left_join(TNK_avgs, by="TNK") %>%
+    left_join(UPM_avgs, by="UPM") %>%
+    group_by(TXK) %>%
+    summarize(b_x = mean(V_TE005M - mu_hat - b_m - b_i - b_h))
+# Calculating mean by min air temp 2cm above ground
+month_avgs <- train_edx %>%
+    left_join(TMK_avgs, by="TMK") %>%
+    left_join(VPM_avgs, by="VPM") %>%
+    left_join(TNK_avgs, by="TNK") %>%
+    left_join(UPM_avgs, by="UPM") %>%
+    left_join(TXK_avgs, by="TXK") %>%
+    group_by(month_m) %>%
+    summarize(b_t = mean(V_TE005M - mu_hat - b_m - b_i - b_h - b_x))
+# Computing predicted soil temperatures on test_edx dataset
+mean_TMK_TNK_UPM_TXK_month_model <- test_edx %>%
+    left_join(TMK_avgs, by="TMK") %>%
+    left_join(TNK_avgs, by="TNK") %>%
+    left_join(UPM_avgs, by="UPM") %>%
+    left_join(TXK_avgs, by="TXK") %>%
+    left_join(month_avgs, by="month_m") %>%
+    mutate(pred = mu_hat + b_m + b_i + b_h + b_x + b_t) %>%
+    pull(pred)
+mean_TMK_TNK_UPM_TXK_month_model_result <- RMSE(mean_TMK_TNK_UPM_TXK_month_model, test_edx$V_TE005M)
+# Expanding results dataframe
+results <- results %>% add_row(model="_Mean_+_TMK_+_TNK_+_UPM_+_TXK_+_month_ **test**", RMSE=mean_TMK_TNK_UPM_TXK_month_model_result)
+results %>% kable(format = "simple", align = 'c') 
+```
+
+
+## Linear model with regularization
+
+### Background  
+The regularization approach allows us to adjust for variables with large estimates which were formed from small sample sizes by adding the term $\lambda$ (lambda). However, given the nature of the technical measurements, I do not expect that regularization will have an important impact on the RMSE.  
+
+The following equation will be applied:   
+
+\[\boxed{\hat{b_{i}} (\lambda) = \frac{1}{\lambda + n_{i}} \sum_{u=1}^{n_{i}} (Y_{i} - \hat{\mu})}\]   
+
+
+
+### Considering mean, maximum & minimum air temperature, relative humidity & month of measurement with regularization 
+```{r, echo=TRUE, include=TRUE, fig.width=12, fig.height=8}
+# Mean of all soil temperatures
+mu_hat <- mean(train_edx$V_TE005M) 
+# Defining string of lambdas
+lambdas <- seq(0, 0.75, 0.01) 
+# Cross-validation of lambdas
+rmses <- sapply(lambdas, function(lambda){
+    # Including mean air temperature
+    b_i <- train_edx %>%
+      group_by(TMK) %>%
+      summarize(b_i = sum(V_TE005M - mu_hat) / (n() + lambda))
+    # Including minimum temp at 2m
+    b_m <- train_edx %>%     
+      left_join(b_i, by="TMK") %>%
+      group_by(TNK) %>%
+      summarize(b_m = sum(V_TE005M - b_i - mu_hat) / (n() + lambda))
+    # Including humidity
+    b_h <- train_edx %>%     
+      left_join(b_i, by="TMK") %>%
+      left_join(b_m, by="TNK") %>%
+      group_by(VPM) %>%
+      summarize(b_h = sum(V_TE005M-b_m-b_i-mu_hat) / (n()+lambda))
+    # Including max temp at 2m height
+    b_x <- train_edx %>%    
+      left_join(b_i, by="TMK") %>%
+      left_join(b_h, by="VPM") %>%
+      left_join(b_m, by="TNK") %>%
+      group_by(TXK) %>%
+      summarize(b_x = sum(V_TE005M - b_m -b_i - b_h-mu_hat) / (n() + lambda))
+    # Including month
+    b_t <- train_edx %>%    
+      left_join(b_i, by="TMK") %>%
+      left_join(b_h, by="VPM") %>%
+      left_join(b_m, by="TNK") %>%
+      group_by(month_m) %>%
+      summarize(b_t = sum(V_TE005M - b_m -b_i - b_h-b_x-mu_hat) / (n() + lambda))
+    # Predicting soil temp
+    predicted_temps <- test_edx %>%      
+      left_join(b_i, by="TMK") %>%
+      left_join(b_h, by="VPM") %>%
+      left_join(b_m, by="TNK") %>%
+      left_join(b_x, by="TXK") %>%
+      left_join(b_t, by="month_m") %>%
+      mutate(pred = mu_hat + b_m + b_i + b_h + b_x + b_t) %>%
+      pull(pred)
+   return(RMSE(predicted_temps, test_edx$V_TE005M))
+})
+
+# Plot: RMSEs versus lambdas
+dataframe <- data.frame(RMSE = rmses, lambdas = lambdas)
+ggplot(dataframe, aes(lambdas, rmses)) +
+  geom_point()+
+  labs(title = "RMSEs versus Lambdas - Regularized Linear Model")+
+  labs(x = "lambdas", y = "RMSEs")
+
+# Identifying lambda value associated with lowest RMSE
+lambda_min <- lambdas[which.min(rmses)]
+
+# Predicting RMSE on the test_edx set
+reg_model <- min(rmses)
+
+# Expanding results dataframe
+results <- results %>% 
+  add_row(model="_Mean_+_TMK_+_VPM_+_TNK_+_TXK_+_month_+_Reg_ **test**", RMSE=reg_model)
+
+results %>% kable(format = "simple", align = 'c')
+```
+
+> The optimal lambda generated using the training dataset only is:  
+```{r , echo=FALSE, include=TRUE}
+lambda_min
+```
+
+Adding regularization to the linear model did not improve (decrease) the RMSE. Perhaps a more complex model may be more accurate.  
+
+\newpage
+## k nearest neighbor (knn)  
+The knn concept assumes that similar observations (data points) are in close proximity to each other. First, the distance between all observations based on features will be defined. Next, for any data point for which an estimate is warranted, the k nearest data points will be assessed. In short, the knn model calculates distances between data points. The existing data points closest to a given data point by the calculated distance will become the “k-neighbors”; k stands for the number of neighbors considered. The optimal k can be determined using cross-validation.  
+```{r knn, echo=TRUE, include=TRUE, fig.width = 12, fig.height = 8}
+model_knn <- train(
+  V_TE005M ~ RSK + SDK + VPM + TMK + UPM + TXK + TNK + TGK + month_m, 
+  method = "knn", 
+  data = edx,
+  trControl = trainControl(method = "cv", 
+                           number = 5, 
+                           verboseIter = FALSE),
+  tuneGrid = expand.grid(k = seq(10, 25, 1))
+  )
+
+model_knn
+ggplot(model_knn, highlight = TRUE)+
+  labs(title = "RMSEs versus k")+
+  labs(x = "neighbors")
+results <- results %>% 
+  add_row(model="_knn_ **test**", RMSE=model_knn$results$RMSE[which.min(model_knn$results$RMSE)])
+results %>% kable(format = "simple", align = 'c')
+```
+
+The k nearest neighbor model further improved (decreased) the RMSE, as compared to the linear model. However, growing a random forest will perhaps result in a better prediction of soil temperatures.  
+\newpage
+
+## Random forest  
+
+Next, a random forest model will be fitted using the ranger method with a 5-fold cross-validation ('cv'; i.e., 80/20 split). The idea behind random forests is to improve shortcomings of decision trees. By averaging multiple decision trees, instability may be reduced. In contrast to R RandomForest function, the R ranger function runs in finite time (on my personal computer). Unfortunately, the number of trees cannot be determined in tuneGrid, which is why I opted for three training rounds with 250, 500, and 1,000 trees, respectively.
+
+### 250 trees  
+```{r rf 250, echo=TRUE, include=TRUE}
+model_rf_250 <- train(
+  V_TE005M ~ RSK + SDK + VPM + TMK + UPM + TXK + TNK + TGK + month_m,
+  tuneLength = 1,
+  data = edx, 
+  method = "ranger",
+  num.trees = 250,
+  tuneGrid = expand.grid(splitrule = c("variance","extratrees"), mtry = c(5:7), min.node.size = c(8:13)),
+  trControl = trainControl(method = "cv", 
+                           number = 5, 
+                           verboseIter = FALSE)
+)
+
+model_rf_250
+
+results <- results %>% 
+  add_row(model="_RandomForest_ *250* **test**", RMSE=model_rf_250$results$RMSE[which.min(model_rf_250$results$RMSE)])
+results %>% kable(format = "simple", align = 'c')
+```
+
+\newpage
+### 500 trees  
+```{r rf 500, echo=TRUE, include=TRUE}
+model_rf_500 <- train(
+  V_TE005M ~ RSK + SDK + VPM + TMK + UPM + TXK + TNK + TGK + month_m,
+  tuneLength = 1,
+  data = edx, 
+  method = "ranger",
+  num.trees = 500,
+  tuneGrid = expand.grid(splitrule = c("variance","extratrees"), mtry = c(5:7), min.node.size = c(8:13)),
+  trControl = trainControl(method = "cv", 
+                           number = 5, 
+                           verboseIter = FALSE)
+)
+
+model_rf_500
+
+results <- results %>% 
+  add_row(model="_RandomForest_ *500* **test**", RMSE=model_rf_500$results$RMSE[which.min(model_rf_500$results$RMSE)])
+results %>% kable(format = "simple", align = 'c')
+```
+
+\newpage
+### 1,000 trees  
+```{r rf 1000, echo=TRUE, include=TRUE}
+model_rf_1000 <- train(
+  V_TE005M ~ RSK + SDK + VPM + TMK + UPM + TXK + TNK + TGK + month_m,
+  tuneLength = 1,
+  data = edx, 
+  method = "ranger",
+  num.trees = 1000,
+  tuneGrid = expand.grid(splitrule = c("variance","extratrees"), mtry = c(5:7), min.node.size = c(8:13)),
+  trControl = trainControl(method = "cv", 
+                           number = 5, 
+                           verboseIter = FALSE)
+)
+
+model_rf_1000
+
+results <- results %>% 
+  add_row(model="_RandomForest_ *1000* **test**", RMSE=model_rf_1000$results$RMSE[which.min(model_rf_1000$results$RMSE)])
+results %>% kable(format = "simple", align = 'c')
+```
+
+The random forest model including 1,000 trees performed best. However, I do not expect that the RMSE decreases relevantly further by increasing the number of trees even more. Hence, I opt to apply this model to the validation dataset. However, it needs to be kept in mind that the interpretability of random forest is limited, as compared to e.g. linear models.    
+
+\newpage
+## Final model applied to validation dataset
+```{r final validation, echo=TRUE, include=TRUE}
+predvalues <- predict(model_rf_1000, newdata = validation)
+
+final_rmse <- RMSE(predvalues, validation$V_TE005M)
+
+results <- results %>% add_row(model="_RandomForest_ *1000* **validation**", RMSE=RMSE(predvalues, validation$V_TE005M))
+results %>% kable(format = "simple", align = 'c')
+```
+
+
+  
+***
+  
+\newpage
+
+# Results
+
+## Table summary
+The table below summarizes the results of this project.  
+
+```{r, echo=FALSE, include=TRUE}
+# Shows the results
+results %>% kable(format = "simple", align = 'c')
+```
+
+## Final RMSE value
+
+```{r, echo=TRUE, include=TRUE}
+final_rmse
+```
+  
+***
+  
+# Conclusion
+
+When predicting soil temperatures at 5cm depth, a random forest model provided the best result (lowest RMSE). However, this model was not capable of producing an RMSE below 1.0. Expanding the dataset with observations from other weather stations by pooling measurements, or perhaps stratifying soil temperatures may improve model performance.
+  
+***  
+\newpage
+# References
+> <https://rafalab.github.io/dsbook/>  
+> Behrendt, J., et al.: Beschreibung der Datenbasis des NKDZ. Version 3.5, Offenbach, 15.02.2011.
+> DWD Vorschriften und Betriebsunterlagen Nr. 2 (VuB 2), Wetterschlüsselhandbuch Band D, Nov 2013.
+> DWD Vorschriften und Betriebsunterlagen Nr. 3 (VuB 3), Beobachterhandbuch (BHB) für Wettermeldestellen des synoptisch-klimatologischen Mess- und Beobachtungsnetzes, März 2014a.
+> DWD Vorschriften und Betriebsunterlagen Nr. 3 (VuB 3), Technikerhandbuch (THB) für Wettermeldestellen des synoptisch-klimatologischen Mess- und Beobachtungsnetzes, März 2014b.ml  
+> <https://upload.wikimedia.org/wikipedia/commons/6/6f/Locator_map_HB_%28Bremen%29_in_Germany.svg>; TUBS, CC BY-SA 3.0 <https://creativecommons.org/licenses/by-sa/3.0>, via Wikimedia Commons    
+> <https://extensionpublications.unl.edu/assets/pdf/g2122.pdf> 
+> <https://en.wikipedia.org/wiki/Pareto_principle>  
+> <https://en.wikipedia.org/wiki/Enthalpy_of_fusion>  
+> <https://stat-ata-asu.github.io/MachineLearningToolbox/tuning-model-parameters-to-improve-performance.html#fit-a-random-forest>  
+> <https://cran.r-project.org/web/packages/ranger/ranger.pdf>  
+  
+***  
+
+# Source
+> Deutscher Wetterdienst  
+> Data basis: Deutscher Wetterdienst, averaged over individual values  
+> <https://opendata.dwd.de/climate_environment/CDC/observations_germany/climate/daily/soil_temperature/historical/tageswerte_EB_00691_19510101_20211231_hist.zip>  
+> <https://opendata.dwd.de/climate_environment/CDC/observations_germany/climate/daily/kl/historical/tageswerte_KL_00691_18900101_20211231_hist.zip>    
+
+
+***  
+
+\newpage 
+  
+# Appendix
+  
+## Transforming RMarkdown to RScript
+```{r, echo=TRUE, include=TRUE}
+# Example code
+# knitr::purl("grafj_wetter_r_markdown.Rmd", documentation = 2)
+```
+  
+## R Version
+```{r, echo=TRUE, include=TRUE}
+version
+```
+  
+***
